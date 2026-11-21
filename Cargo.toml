@@ -1,0 +1,17 @@
+[package]
+name = "rustos-image"
+version = "0.1.0"
+edition = "2021"
+description = "Build bootable RustOS disk images: GPT/MBR partitioning with a minimal FAT16 EFI System Partition (std-only, no external crates)"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "rustos-image"
+path = "src/main.rs"
+
+[lib]
+name = "rustos_image"
+path = "src/lib.rs"
+
+[profile.release]
+debug = false
