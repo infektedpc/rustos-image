@@ -1,8 +1,18 @@
 # rustos-image
 
-Builds a bootable RustOS disk image from a kernel ELF/binary plus
-bootloader files. Std-only — no external crates. The FAT16 writer and
-the GPT/MBR writers are implemented in this crate (`src/lib.rs`).
+Builds a RustOS disk image from a kernel ELF/binary. Std-only — no
+external crates. The FAT16 writer and the GPT/MBR writers are
+implemented in this crate (`src/lib.rs`).
+
+> **Honest scope:** `build_image` writes a kernel-only ESP — just
+> `KERNEL.EFI` (or `KERNEL.BIN`) in the ESP root. That is a correctly
+> partitioned container, but it is **not UEFI-bootable on its own**:
+> OVMF finds no `efi/boot/bootx64.efi` and drops to the UEFI shell.
+> The bootable image comes from `rustos-bootloader`, which embeds
+> the bootloader crate's UEFI stage (`efi/boot/bootx64.efi`) plus the
+> kernel (`kernel-x86_64`) and `boot.json` — see the rustos-build
+> README "Boot flow". Use `rustos-image` for the low-level GPT/FAT
+> machinery and for inspection, not as the boot path.
 
 ## Layout (default, GPT, 64 MiB)
 
@@ -42,12 +52,18 @@ defaults to 64 and must be >= 16 (large enough for a 1 MiB-aligned
 ESP plus backup GPT). The kernel is copied into the ESP as
 `KERNEL.EFI` (for `.efi` input) or `KERNEL.BIN` (anything else).
 `inspect` prints the partition scheme, each partition's LBA range
-and type, and the files in the ESP root directory.
+and type, and every file in the ESP — recursing into subdirectories
+(FAT12/16/32, long file names resolved, volume labels skipped), so
+it also lists the contents of a bootloader-built image
+(`efi/boot/bootx64.efi`, `kernel-x86_64`, `boot.json`).
 
 ## Limitations
 
-- FAT16 only (no FAT32, no long filenames — 8.3 names only).
-- One file is placed in the ESP: the kernel. No bootloader files
-  yet — add them by extending `write_fat16` / `build_image`.
-- No UEFI bootloader is bundled; the image is a correctly
-  partitioned container ready for one.
+- FAT16 writer only (no FAT32 writer, no long filenames — 8.3
+  names only when *writing*). The *reader* (`inspect`) handles
+  FAT12/16/32, subdirectories, and long file names.
+- One file is placed in the ESP by `build_image`: the kernel. No
+  bootloader files — a `build_image` disk does not boot under UEFI
+  (see the note at the top). The bootable path is
+  `rustos-bootloader`.
+- No UEFI bootloader is bundled here.

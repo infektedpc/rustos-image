@@ -1,4 +1,13 @@
-//! rustos-image: build a bootable disk image from a kernel file.
+//! rustos-image: build a disk image from a kernel file, and inspect one.
+//!
+//! NOTE on scope: `build_image` writes a kernel-only ESP (just the
+//! kernel file in the ESP root). That is a correctly partitioned
+//! container, but it is NOT UEFI-bootable on its own — OVMF finds no
+//! `efi/boot/bootx64.efi` and drops to the UEFI shell. The bootable
+//! image comes from `rustos-bootloader` (see the rustos-build README
+//! "Boot flow"). This crate is the low-level GPT/FAT machinery plus
+//! the inspector, whose FAT reader walks the whole ESP tree
+//! (subdirectories, FAT12/16/32, long file names).
 //!
 //! Std-only. Implements, by hand:
 //! * CRC-32/IEEE (for GPT headers and partition-entry arrays)
@@ -386,43 +395,318 @@ pub fn build_image(opts: &ImageOptions) -> Result<ImageInfo, String> {
     })
 }
 
-fn fat_root_files(img: &[u8], esp_start: u64) -> Vec<String> {
-    let off = esp_start as usize * SECTOR_SIZE;
-    if off + SECTOR_SIZE > img.len() {
-        return Vec::new();
+/// Next cluster in a FAT12 chain: entries are packed 12-bit values,
+/// two entries per three bytes.
+fn fat12_next(fat: &[u8], cluster: u32) -> u32 {
+    let off = cluster as usize + (cluster as usize) / 2;
+    if off + 1 >= fat.len() {
+        return 0xFFF; // out of range reads as end-of-chain
     }
-    let bs = &img[off..off + SECTOR_SIZE];
-    if get_u16(bs, 11) as usize != SECTOR_SIZE {
-        return Vec::new();
+    let b0 = fat[off] as u32;
+    let b1 = fat[off + 1] as u32;
+    if cluster % 2 == 0 {
+        b0 | ((b1 & 0x0F) << 8)
+    } else {
+        (b0 >> 4) | (b1 << 4)
     }
-    let reserved = get_u16(bs, 14) as u64;
-    let fats = bs[16] as u64;
-    let fat_sectors = get_u16(bs, 22) as u64;
-    let root_off = off + ((reserved + fats * fat_sectors) as usize * SECTOR_SIZE);
-    let root_entries = get_u16(bs, 17) as usize;
-    let mut files = Vec::new();
-    for i in 0..root_entries {
-        let eoff = root_off + i * 32;
-        if eoff + 32 > img.len() {
-            break;
+}
+
+/// FAT type, decided by cluster count (Microsoft's rule).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FatType {
+    Fat12,
+    Fat16,
+    Fat32,
+}
+
+/// A read view over a FAT volume inside `img` (the ESP), for inspection.
+/// Handles FAT12/16/32, subdirectory chains, and long file names (LFN).
+struct FatView<'a> {
+    img: &'a [u8],
+    esp_off: usize,
+    bytes_per_sector: u64,
+    sectors_per_cluster: u64,
+    reserved: u64,
+    fats: u64,
+    fat_sectors: u64,
+    root_cluster: u32, // FAT32 only
+    fat_type: FatType,
+    root_dir_sectors: u64,
+    first_data_sector: u64,
+}
+
+impl<'a> FatView<'a> {
+    /// Parse the BPB at `esp_start` (in 512-byte sectors). `None` when
+    /// the volume does not look like a FAT filesystem.
+    fn parse(img: &'a [u8], esp_start: u64) -> Option<Self> {
+        let off = esp_start as usize * SECTOR_SIZE;
+        if off + SECTOR_SIZE > img.len() {
+            return None;
         }
-        let e = &img[eoff..eoff + 32];
-        if e[0] == 0x00 {
-            break;
+        let bs = &img[off..off + SECTOR_SIZE];
+        let bytes_per_sector = get_u16(bs, 11) as u64;
+        if bytes_per_sector == 0 || bytes_per_sector % SECTOR_SIZE as u64 != 0 {
+            return None;
         }
-        if e[0] == 0xE5 || e[11] == 0x0F {
-            continue; // deleted / long-name entry
+        let sectors_per_cluster = bs[13] as u64;
+        if sectors_per_cluster == 0 {
+            return None;
         }
-        let stem = String::from_utf8_lossy(&e[0..8]).trim_end().to_string();
-        let ext = String::from_utf8_lossy(&e[8..11]).trim_end().to_string();
-        let size = get_u32(e, 28);
-        if ext.is_empty() {
-            files.push(format!("{} ({} bytes)", stem, size));
+        let reserved = get_u16(bs, 14) as u64;
+        let fats = bs[16] as u64;
+        let root_entries = get_u16(bs, 17) as u64;
+        let total_sectors = {
+            let t16 = get_u16(bs, 19) as u64;
+            if t16 != 0 { t16 } else { get_u32(bs, 32) as u64 }
+        };
+        let fat_sectors = {
+            let f16 = get_u16(bs, 22) as u64;
+            if f16 != 0 { f16 } else { get_u32(bs, 36) as u64 }
+        };
+        if fats == 0 || fat_sectors == 0 || total_sectors == 0 {
+            return None;
+        }
+        let root_dir_sectors =
+            ((root_entries * 32) + (bytes_per_sector - 1)) / bytes_per_sector;
+        let first_data_sector = reserved + fats * fat_sectors + root_dir_sectors;
+        if first_data_sector >= total_sectors {
+            return None;
+        }
+        let clusters =
+            (total_sectors - first_data_sector) / sectors_per_cluster;
+        let fat_type = if clusters < 4085 {
+            FatType::Fat12
+        } else if clusters < 65525 {
+            FatType::Fat16
         } else {
-            files.push(format!("{}.{} ({} bytes)", stem, ext, size));
+            FatType::Fat32
+        };
+        let root_cluster = if fat_type == FatType::Fat32 {
+            get_u32(bs, 44)
+        } else {
+            0
+        };
+        Some(Self {
+            img,
+            esp_off: off,
+            bytes_per_sector,
+            sectors_per_cluster,
+            reserved,
+            fats,
+            fat_sectors,
+            root_cluster,
+            fat_type,
+            root_dir_sectors,
+            first_data_sector,
+        })
+    }
+
+    /// Byte offset of a sector (relative to the start of `img`).
+    fn sector_off(&self, sector: u64) -> usize {
+        self.esp_off + sector as usize * self.bytes_per_sector as usize
+    }
+
+    /// Byte offset of the first byte of `cluster`'s data.
+    fn cluster_off(&self, cluster: u32) -> usize {
+        self.sector_off(
+            self.first_data_sector + (cluster as u64 - 2) * self.sectors_per_cluster,
+        )
+    }
+
+    /// The next cluster in `cluster`'s chain (first FAT copy).
+    /// Returns `None` for end-of-chain / free / out of range.
+    fn next_cluster(&self, cluster: u32) -> Option<u32> {
+        let fat_off = self.sector_off(self.reserved);
+        let (eoc, mask): (u32, u32) = match self.fat_type {
+            FatType::Fat12 => (0xFF8, 0xFFF),
+            FatType::Fat16 => (0xFFF8, 0xFFFF),
+            FatType::Fat32 => (0x0FFF_FFF8, 0x0FFF_FFFF),
+        };
+        let value = match self.fat_type {
+            FatType::Fat12 => {
+                let fat_off = self.sector_off(self.reserved);
+                let fat = &self.img[fat_off..];
+                fat12_next(fat, cluster)
+            }
+            FatType::Fat16 => {
+                let off = fat_off + cluster as usize * 2;
+                if off + 1 >= self.img.len() {
+                    return None;
+                }
+                get_u16(self.img, off) as u32
+            }
+            FatType::Fat32 => {
+                let off = fat_off + cluster as usize * 4;
+                if off + 3 >= self.img.len() {
+                    return None;
+                }
+                get_u32(self.img, off) & mask
+            }
+        };
+        if value < 2 || value >= eoc {
+            None
+        } else {
+            Some(value)
         }
     }
-    files
+
+    /// Walk one directory — the root (FAT12/16: fixed region; FAT32:
+    /// `root_cluster` chain) or a subdirectory chain starting at
+    /// `first_cluster` — appending `(path, size)` for every file below
+    /// `prefix` (subdirectories recurse, `.`/`..` skipped).
+    fn walk_dir(
+        &self,
+        first_cluster: Option<u32>,
+        prefix: &str,
+        out: &mut Vec<(String, u32)>,
+    ) {
+        // Collect the directory's bytes: either the fixed root region
+        // or the cluster chain, with a loop guard against corrupt FATs.
+        let mut dir_bytes: Vec<u8> = Vec::new();
+        match first_cluster {
+            None => {
+                // Fixed root directory (FAT12/16).
+                let root_off = self.sector_off(self.reserved + self.fats * self.fat_sectors);
+                let len = self.root_dir_sectors as usize * self.bytes_per_sector as usize;
+                if root_off + len <= self.img.len() {
+                    dir_bytes.extend_from_slice(&self.img[root_off..root_off + len]);
+                }
+            }
+            Some(mut cluster) => {
+                let mut seen = 0usize;
+                while cluster >= 2 && seen < 1_000_000 {
+                    seen += 1;
+                    let off = self.cluster_off(cluster);
+                    let len =
+                        self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
+                    if off + len > self.img.len() {
+                        break;
+                    }
+                    dir_bytes.extend_from_slice(&self.img[off..off + len]);
+                    match self.next_cluster(cluster) {
+                        Some(next) => cluster = next,
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        // LFN entries precede their short entry; sequence numbers run
+        // highest-first, so collect slots and join in sequence order.
+        let mut lfn_slots: Vec<(u8, [u16; 13])> = Vec::new();
+        let mut i = 0;
+        while i + 32 <= dir_bytes.len() {
+            let e = &dir_bytes[i..i + 32];
+            i += 32;
+            if e[0] == 0x00 {
+                break; // end of directory
+            }
+            if e[0] == 0xE5 {
+                lfn_slots.clear(); // deleted entry: drop any pending LFN
+                continue;
+            }
+            let attr = e[11];
+            if attr == 0x0F {
+                // Long-name entry: 13 UCS-2 chars at 1..11, 14..26, 28..32.
+                let seq = e[0] & 0x1F;
+                let mut chars = [0u16; 13];
+                for (j, &off) in [1usize, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30]
+                    .iter()
+                    .enumerate()
+                {
+                    chars[j] = u16::from_le_bytes([e[off], e[off + 1]]);
+                }
+                lfn_slots.push((seq, chars));
+                continue;
+            }
+            if attr == 0x08 {
+                lfn_slots.clear(); // volume label: not a file
+                continue;
+            }
+            // Short entry: resolve the name (LFN wins when present).
+            let name = match lfn_name(&lfn_slots) {
+                Some(n) if !n.is_empty() => n,
+                _ => short_name(e),
+            };
+            lfn_slots.clear();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let first_cluster = get_u16(e, 26) as u32;
+            let size = get_u32(e, 28);
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", prefix, name)
+            };
+            if attr & 0x10 != 0 {
+                // Subdirectory: recurse (cluster 0 means empty dir).
+                if first_cluster >= 2 {
+                    self.walk_dir(Some(first_cluster), &path, out);
+                }
+            } else {
+                out.push((path, size));
+            }
+        }
+    }
+
+    /// Every file in the volume, as `"path (N bytes)"` strings.
+    fn list_files(&self) -> Vec<String> {
+        let mut files = Vec::new();
+        match self.fat_type {
+            FatType::Fat32 => self.walk_dir(Some(self.root_cluster), "", &mut files),
+            _ => self.walk_dir(None, "", &mut files),
+        }
+        files
+            .iter()
+            .map(|(p, s)| format!("{} ({} bytes)", p, s))
+            .collect()
+    }
+}
+
+/// Reassemble a long file name from collected LFN slots, or `None`
+/// when there are none. Slots arrive highest-sequence-first.
+fn lfn_name(slots: &[(u8, [u16; 13])]) -> Option<String> {
+    if slots.is_empty() {
+        return None;
+    }
+    let mut ordered = slots.to_vec();
+    ordered.sort_by_key(|(seq, _)| *seq);
+    let mut out = String::new();
+    for (_, chars) in ordered {
+        for &c in chars.iter() {
+            if c == 0x0000 {
+                return Some(out);
+            }
+            if c == 0xFFFF {
+                continue;
+            }
+            if let Some(ch) = char::from_u32(c as u32) {
+                out.push(ch);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// 8.3 short name of a directory entry, e.g. `KERNEL.BIN`.
+fn short_name(e: &[u8]) -> String {
+    let stem = String::from_utf8_lossy(&e[0..8]).trim_end().to_string();
+    let ext = String::from_utf8_lossy(&e[8..11]).trim_end().to_string();
+    if ext.is_empty() {
+        stem
+    } else {
+        format!("{}.{}", stem, ext)
+    }
+}
+
+fn fat_root_files(img: &[u8], esp_start: u64) -> Vec<String> {
+    // Despite the name (kept for the call sites): lists every file in
+    // the ESP, recursing into subdirectories, with long names resolved.
+    match FatView::parse(img, esp_start) {
+        Some(view) => view.list_files(),
+        None => Vec::new(),
+    }
 }
 
 /// Parse an image produced by `build_image` (or a compatible one).
@@ -650,5 +934,115 @@ mod tests {
         fs::write(&p, vec![0u8; 4096]).unwrap();
         assert!(inspect_image(&p).is_err());
         let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn lfn_name_reassembles_sequences() {
+        // "a-very-long-filename.txt" is 24 chars: two LFN entries, the
+        // second sequence stored first on disk (highest-first order).
+        let mk = |s: &str| -> [u16; 13] {
+            let mut out = [0xFFFFu16; 13];
+            for (i, c) in s.chars().enumerate() {
+                out[i] = c as u16;
+            }
+            if s.len() < 13 {
+                out[s.len()] = 0x0000;
+            }
+            out
+        };
+        let slots = vec![(2u8, mk("ilename.txt")), (1u8, mk("a-very-long-f"))];
+        assert_eq!(
+            lfn_name(&slots).as_deref(),
+            Some("a-very-long-filename.txt")
+        );
+        // Exactly 13 chars fit in one entry.
+        let single = vec![(1u8, mk("kernel-x86_64"))];
+        assert_eq!(lfn_name(&single).as_deref(), Some("kernel-x86_64"));
+        assert_eq!(lfn_name(&[]), None);
+    }
+
+    #[test]
+    fn fat12_entry_decoding() {
+        // FAT bytes: [F8 FF] [FF] then cluster 2 -> 3, 3 -> 4, 4 -> EOC.
+        let fat = [0xF8u8, 0xFF, 0xFF, 0x03, 0x40, 0x00, 0xFF, 0x0F];
+        assert_eq!(fat12_next(&fat, 2), 3);
+        assert_eq!(fat12_next(&fat, 3), 4);
+        assert_eq!(fat12_next(&fat, 4), 0xFFF);
+    }
+
+    #[test]
+    fn inspect_lists_subdirectory_and_skips_volume_label() {
+        // Build a normal single-file image, then hand-patch a
+        // subdirectory + volume label into its FAT16 ESP.
+        let kernel = dummy_kernel("k5.bin", 8192);
+        let out = tmp_path("disk5.img");
+        build_image(&ImageOptions {
+            kernel_path: kernel.clone(),
+            output_path: out.clone(),
+            size_mb: 16,
+            scheme: PartitionScheme::Gpt,
+        })
+        .unwrap();
+        let mut img = fs::read(&out).unwrap();
+        let esp = ESP_START_LBA as usize * SECTOR_SIZE;
+        let bs = &img[esp..esp + SECTOR_SIZE];
+        let reserved = get_u16(bs, 14) as usize;
+        let fats = bs[16] as usize;
+        let fat_sectors = get_u16(bs, 22) as usize;
+        let root_off = esp + (reserved + fats * fat_sectors) * SECTOR_SIZE;
+        let root_dir_sectors = 32usize; // 512 entries * 32 bytes
+        let data_off = root_off + root_dir_sectors * SECTOR_SIZE;
+        let cluster_off = |c: usize| data_off + (c - 2) * SECTOR_SIZE;
+        let set_fat16 = |img: &mut [u8], cluster: usize, value: u16| {
+            for f in 0..fats {
+                let off = esp + (reserved + f * fat_sectors) * SECTOR_SIZE + cluster * 2;
+                img[off..off + 2].copy_from_slice(&value.to_le_bytes());
+            }
+        };
+        // Root slot 1 (after KERNEL.BIN): subdirectory "SUBDIR", cluster 18.
+        let mut sub = [0u8; 32];
+        sub[0..11].copy_from_slice(b"SUBDIR     ");
+        sub[11] = 0x10;
+        sub[26..28].copy_from_slice(&18u16.to_le_bytes());
+        img[root_off + 32..root_off + 64].copy_from_slice(&sub);
+        // Root slot 2: volume label — must be skipped by the listing.
+        let mut label = [0u8; 32];
+        label[0..11].copy_from_slice(b"MYLABEL    ");
+        label[11] = 0x08;
+        img[root_off + 64..root_off + 96].copy_from_slice(&label);
+        // Cluster 18 holds the subdirectory: one file entry, then END.
+        set_fat16(&mut img, 18, 0xFFFF);
+        let mut inner = [0u8; 32];
+        inner[0..11].copy_from_slice(b"INNER   TXT");
+        inner[11] = 0x20;
+        inner[26..28].copy_from_slice(&19u16.to_le_bytes());
+        inner[28..32].copy_from_slice(&42u32.to_le_bytes());
+        let c18 = cluster_off(18);
+        img[c18..c18 + 32].copy_from_slice(&inner);
+        set_fat16(&mut img, 19, 0xFFFF);
+        let c19 = cluster_off(19);
+        img[c19..c19 + 42].copy_from_slice(&[0xAB; 42]);
+
+        let out2 = tmp_path("disk5b.img");
+        fs::write(&out2, &img).unwrap();
+        let rep = inspect_image(&out2).unwrap();
+        assert!(
+            rep.esp_files.iter().any(|f| f == "KERNEL.BIN (8192 bytes)"),
+            "{:?}",
+            rep.esp_files
+        );
+        assert!(
+            rep.esp_files.iter().any(|f| f == "SUBDIR/INNER.TXT (42 bytes)"),
+            "{:?}",
+            rep.esp_files
+        );
+        assert!(
+            !rep.esp_files.iter().any(|f| f.contains("MYLABEL")),
+            "{:?}",
+            rep.esp_files
+        );
+        let _ = fs::remove_file(&kernel);
+        let _ = fs::remove_file(&out);
+        let _ = fs::remove_file(&out2);
     }
 }
